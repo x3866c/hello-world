@@ -1,0 +1,38 @@
+name: Cleanup
+
+on:
+  schedule:
+    - cron: "0 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  cleanup:
+    name: Delete Workflow Run History
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete workflow runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+        run: |
+          while true; do
+            mapfile -t RUN_IDS < <(
+              gh api "repos/${REPO}/actions/runs?per_page=100" \
+                --jq ".workflow_runs[] | select(.status == \"completed\" and .id != ${CURRENT_RUN_ID}) | .id"
+            )
+
+            if [ "${#RUN_IDS[@]}" -eq 0 ]; then
+              echo "No workflow runs to delete."
+              break
+            fi
+
+            for run_id in "${RUN_IDS[@]}"; do
+              echo "Deleting workflow run ${run_id}"
+              gh api --method DELETE "repos/${REPO}/actions/runs/${run_id}"
+            done
+          done
