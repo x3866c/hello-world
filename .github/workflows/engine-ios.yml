@@ -1,0 +1,145 @@
+name: Engine iOS
+
+# Builds the patched Flutter engine (private repo reeden-org/flutter) as release Flutter.framework for iOS arm64
+# devices, with the dSYM from the same build, and publishes it as a release of that repo
+# (tag ios-engine-<Flutter version>-<first 10 chars of the commit>).
+# Secrets: ENGINE_TOKEN (falls back to GIT_PAT) — needs read access and release (contents) write on reeden-org/flutter.
+
+run-name: Engine iOS (${{ inputs.ref }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit of reeden-org/flutter"
+        type: string
+        default: patched/3.44.9
+
+permissions:
+  contents: read
+
+env:
+  ENGINE_REPO: reeden-org/flutter
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 360
+    steps:
+      - name: Resolve commit
+        env:
+          ENGINE_TOKEN: ${{ secrets.ENGINE_TOKEN || secrets.GIT_PAT }}
+          REF: ${{ inputs.ref }}
+        run: |
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$ENGINE_TOKEN" | base64 | tr -d '\n')"
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+            sha="$REF"
+          else
+            sha=$(git -c "http.https://github.com/.extraheader=$auth" ls-remote "https://github.com/$ENGINE_REPO.git" \
+              "refs/heads/$REF" "refs/tags/$REF" | head -1 | cut -f1)
+          fi
+          test -n "$sha" || { echo "Cannot resolve $REF"; exit 1; }
+          version=$(echo "$REF" | sed -E 's|^patched/||')
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || version=unknown
+          echo "SHA=$sha" >> "$GITHUB_ENV"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "Building $ENGINE_REPO@$sha (Flutter $version)"
+
+      - name: Free disk space
+        run: |
+          df -h /
+          # Keep only the selected Xcode
+          current=$(cd "$(xcode-select -p)/../.." && pwd -P)
+          for x in /Applications/Xcode*.app; do
+            [ "$(cd "$x" && pwd -P)" = "$current" ] || sudo rm -rf "$x"
+          done
+          sudo rm -rf "${ANDROID_HOME:-/nonexistent}" "$HOME/Library/Android" /usr/local/share/dotnet "$HOME/.dotnet" \
+            "$HOME/hostedtoolcache" /Users/runner/hostedtoolcache || true
+          df -h /
+
+      - name: Metal toolchain
+        # Needed for Impeller shaders; recent Xcode versions download it separately.
+        run: |
+          xcodebuild -version
+          if ! xcrun metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
+            xcrun metal --version
+          fi
+
+      - name: Work directory
+        # Not $HOME/work: GitHub checks out repositories there.
+        run: mkdir -p "$HOME/engine-build" && echo "WORK=$HOME/engine-build" >> "$GITHUB_ENV"
+
+      - name: Install depot_tools
+        run: |
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$WORK/depot_tools"
+          echo "$WORK/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Fetch sources and engine dependencies
+        env:
+          ENGINE_TOKEN: ${{ secrets.ENGINE_TOKEN || secrets.GIT_PAT }}
+        run: |
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$ENGINE_TOKEN" | base64 | tr -d '\n')"
+          git init -q "$WORK/flutter"
+          cd "$WORK/flutter"
+          git -c "http.https://github.com/.extraheader=$auth" fetch -q --depth 1 "https://github.com/$ENGINE_REPO.git" "$SHA"
+          git checkout -q FETCH_HEAD
+          cat > .gclient <<'GCLIENT'
+          solutions = [
+            {
+              "custom_deps": {},
+              "deps_file": "DEPS",
+              "managed": False,
+              "name": ".",
+              "safesync_url": "",
+              "url": "https://github.com/flutter/flutter.git",
+              "custom_vars": {
+                "download_fuchsia_deps": False,
+                "download_esbuild": False,
+                "download_android_deps": False,
+              },
+            },
+          ]
+          GCLIENT
+          gclient sync --no-history --shallow -D
+          df -h /
+
+      - name: Build ios_release
+        run: |
+          cd "$WORK/flutter/engine/src"
+          ./flutter/tools/gn --ios --runtime-mode release --no-rbe --no-goma
+          ninja -C out/ios_release flutter/shell/platform/darwin/ios:flutter_framework
+
+      - name: Extract dSYM, strip, verify
+        # Same as the official artifacts: extract the dSYM from the unstripped binary, then strip -x -S.
+        run: |
+          cd "$WORK/flutter/engine/src"
+          dist="$WORK/dist"
+          mkdir -p "$dist"
+          cp -R out/ios_release/Flutter.framework "$dist/Flutter.framework"
+          flutter/buildtools/mac-arm64/clang/bin/dsymutil -o "$dist/Flutter.framework.dSYM" "$dist/Flutter.framework/Flutter"
+          strip -x -S "$dist/Flutter.framework/Flutter"
+          test "$(lipo -archs "$dist/Flutter.framework/Flutter")" = "arm64"
+          nm -gU "$dist/Flutter.framework/Flutter" | grep -q _InternalFlutterText_DrawPositionedTextBoxes
+          dwarfdump --uuid "$dist/Flutter.framework/Flutter" "$dist/Flutter.framework.dSYM"
+          ls -lh "$dist/Flutter.framework"
+
+      - name: Package
+        run: |
+          cd "$WORK/dist"
+          tar -czf "$WORK/ios-release-flutter-framework.tar.gz" Flutter.framework Flutter.framework.dSYM
+          cd "$WORK"
+          shasum -a 256 ios-release-flutter-framework.tar.gz | tee ios-release-flutter-framework.tar.gz.sha256
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.ENGINE_TOKEN || secrets.GIT_PAT }}
+        run: |
+          cd "$WORK"
+          tag="ios-engine-$VERSION-${SHA:0:10}"
+          notes="Flutter $VERSION + patches, commit $SHA. Release Flutter.framework for iOS arm64 devices, with its dSYM; replace the binary in the official Flutter.framework of the same Flutter version.
+
+          sha256: $(cut -d' ' -f1 ios-release-flutter-framework.tar.gz.sha256)"
+          gh release create "$tag" ios-release-flutter-framework.tar.gz ios-release-flutter-framework.tar.gz.sha256 \
+            --repo "$ENGINE_REPO" --target "$SHA" --title "$tag" --notes "$notes"
+          echo "Published $tag"

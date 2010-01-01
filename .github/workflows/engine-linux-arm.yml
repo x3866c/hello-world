@@ -1,0 +1,135 @@
+name: Engine Linux ARM
+
+# Builds the patched Flutter engine (private repo reeden-org/flutter) for linux armv7 hard-float as an embedder
+# library: libflutter_engine.so, the x64 host gen_snapshot that emits arm32 code, icudtl.dat and flutter_embedder.h,
+# and publishes them as a release of that repo (tag linux-arm-engine-<Flutter version>-<first 10 chars of the commit>).
+# Secrets: ENGINE_TOKEN (falls back to GIT_PAT) — needs read access and release (contents) write on reeden-org/flutter.
+
+run-name: Engine Linux ARM (${{ inputs.ref }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit of reeden-org/flutter"
+        type: string
+        default: patched/3.44.9
+
+permissions:
+  contents: read
+
+env:
+  ENGINE_REPO: reeden-org/flutter
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+    steps:
+      - name: Resolve commit
+        env:
+          ENGINE_TOKEN: ${{ secrets.ENGINE_TOKEN || secrets.GIT_PAT }}
+          REF: ${{ inputs.ref }}
+        run: |
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$ENGINE_TOKEN" | base64 | tr -d '\n')"
+          if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+            sha="$REF"
+          else
+            sha=$(git -c "http.https://github.com/.extraheader=$auth" ls-remote "https://github.com/$ENGINE_REPO.git" \
+              "refs/heads/$REF" "refs/tags/$REF" | head -1 | cut -f1)
+          fi
+          test -n "$sha" || { echo "Cannot resolve $REF"; exit 1; }
+          version=$(echo "$REF" | sed -E 's|^patched/||')
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || version=unknown
+          echo "SHA=$sha" >> "$GITHUB_ENV"
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "Building $ENGINE_REPO@$sha (Flutter $version)"
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache /usr/local/share/boost /usr/local/share/powershell \
+            /usr/share/swift /usr/local/julia* /opt/az /usr/lib/jvm || true
+          sudo docker image prune --all --force > /dev/null || true
+          sudo apt-get clean
+          df -h
+
+      - name: Work directory
+        # Not $HOME/work: GitHub checks out repositories there.
+        run: mkdir -p "$HOME/engine-build" && echo "WORK=$HOME/engine-build" >> "$GITHUB_ENV"
+
+      - name: Install depot_tools
+        run: |
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$WORK/depot_tools"
+          echo "$WORK/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Fetch sources and engine dependencies
+        env:
+          ENGINE_TOKEN: ${{ secrets.ENGINE_TOKEN || secrets.GIT_PAT }}
+        run: |
+          auth="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$ENGINE_TOKEN" | base64 | tr -d '\n')"
+          git init -q "$WORK/flutter"
+          cd "$WORK/flutter"
+          git -c "http.https://github.com/.extraheader=$auth" fetch -q --depth 1 "https://github.com/$ENGINE_REPO.git" "$SHA"
+          git checkout -q FETCH_HEAD
+          cat > .gclient <<'GCLIENT'
+          solutions = [
+            {
+              "custom_deps": {},
+              "deps_file": "DEPS",
+              "managed": False,
+              "name": ".",
+              "safesync_url": "",
+              "url": "https://github.com/flutter/flutter.git",
+              "custom_vars": {
+                "download_fuchsia_deps": False,
+                "download_esbuild": False,
+                "download_android_deps": False,
+              },
+            },
+          ]
+          GCLIENT
+          gclient sync --no-history --shallow -D
+          # The DEPS hooks only install the x64 / arm64 sysroots; the armhf one is listed in sysroots.json.
+          python3 engine/src/build/linux/sysroot_scripts/install-sysroot.py --arch=arm
+          ls engine/src/build/linux/
+
+      - name: Build linux_release_arm
+        # arm_float_abi="hard": armhf userland. No GPU on the targets: Vulkan off for the shell and Skia
+        # (Impeller's Vulkan backend cannot be turned off without duplicate gn outputs, it needs the xcb headers
+        # that the Chromium sysroot ships).
+        run: |
+          cd "$WORK/flutter/engine/src"
+          ./flutter/tools/gn --runtime-mode release --target-os linux --linux-cpu arm \
+            --no-rbe --no-goma --embedder-for-target --disable-desktop-embeddings --no-build-embedder-examples \
+            --no-enable-unittests --no-prebuilt-dart-sdk \
+            --target-sysroot "$PWD/build/linux/debian_bullseye_armhf-sysroot" \
+            --gn-args 'arm_float_abi="hard"' --gn-args shell_enable_vulkan=false --gn-args skia_use_vulkan=false
+          ninja -C out/linux_release_arm \
+            flutter/shell/platform/embedder:flutter_engine flutter/lib/snapshot:generate_snapshot_bins
+
+      - name: Verify and package
+        run: |
+          cd "$WORK/flutter/engine/src/out/linux_release_arm"
+          file libflutter_engine.so clang_x64/gen_snapshot
+          readelf -A libflutter_engine.so | grep -q 'Tag_ABI_VFP_args: VFP registers'
+          readelf -h libflutter_engine.so | grep -q 'Machine:.*ARM'
+          readelf -h clang_x64/gen_snapshot | grep -q 'Machine:.*X86-64'
+          echo "glibc: $(readelf -V libflutter_engine.so | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+          tar -czf "$WORK/linux-arm-embedder-engine.tar.gz" \
+            libflutter_engine.so clang_x64/gen_snapshot icudtl.dat flutter_embedder.h
+          cd "$WORK"
+          sha256sum linux-arm-embedder-engine.tar.gz | tee linux-arm-embedder-engine.tar.gz.sha256
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.ENGINE_TOKEN || secrets.GIT_PAT }}
+        run: |
+          cd "$WORK"
+          tag="linux-arm-engine-$VERSION-${SHA:0:10}"
+          notes="Flutter $VERSION + patches, commit $SHA. Release embedder engine for linux armv7 hard-float (libflutter_engine.so, x64 host gen_snapshot, icudtl.dat, flutter_embedder.h).
+
+          sha256: $(cut -d' ' -f1 linux-arm-embedder-engine.tar.gz.sha256)"
+          gh release create "$tag" linux-arm-embedder-engine.tar.gz linux-arm-embedder-engine.tar.gz.sha256 \
+            --repo "$ENGINE_REPO" --target "$SHA" --title "$tag" --notes "$notes"
+          echo "Published $tag"
