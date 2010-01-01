@@ -1,0 +1,117 @@
+name: Release Appcast
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: "Appcast channel"
+        type: choice
+        required: true
+        default: stable
+        options:
+          - stable
+          - beta
+      platform:
+        description: "Platform to update"
+        type: choice
+        required: true
+        default: all
+        options:
+          - all
+          - Android
+          - iOS
+          - Windows
+          - Linux
+
+permissions: read-all
+
+env:
+  APP_NAME: ${{ secrets.APP_NAME }}
+
+jobs:
+  appcast:
+    name: Upload ${{ inputs.channel }} Appcast (${{ inputs.platform }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.GIT_REPO }}
+          ref: main
+          token: ${{ secrets.GIT_PAT }}
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: "3.41.6"
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Generate Appcast
+        shell: bash
+        run: |
+          set -euo pipefail
+          channel="${{ inputs.channel }}"
+          platform="${{ inputs.platform }}"
+
+          dart scripts/release.dart --appcast-only --channel "$channel"
+
+          copy_appcast() {
+            local target="$1"
+            local destination="$2"
+            mkdir -p "$destination"
+            cp "documents/appcast/${target}"*.xml "$destination"/
+          }
+
+          copy_selected_appcasts() {
+            local destination="$1"
+            local targets=()
+            case "$platform" in
+              all)
+                if [[ "$channel" == "beta" ]]; then
+                  targets=(windows android linux)
+                else
+                  targets=(windows android linux ios)
+                fi
+                ;;
+              Android)
+                targets=(android)
+                ;;
+              iOS)
+                if [[ "$channel" == "beta" ]]; then
+                  echo "Beta appcast does not include iOS." >&2
+                  exit 1
+                fi
+                targets=(ios)
+                ;;
+              Windows)
+                targets=(windows)
+                ;;
+              Linux)
+                targets=(linux)
+                ;;
+            esac
+
+            for target in "${targets[@]}"; do
+              copy_appcast "$target" "$destination"
+            done
+          }
+
+          copy_selected_appcasts artifacts/latest
+          if [[ "$channel" == "stable" ]]; then
+            copy_selected_appcasts artifacts/beta/latest
+          fi
+
+          find artifacts -type f -name '*.xml' -print
+
+      - name: Upload to R2
+        uses: ryand56/r2-upload-action@latest
+        with:
+          r2-account-id: ${{ secrets.R2_ACCOUNT_ID }}
+          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
+          r2-secret-access-key: ${{ secrets.R2_SECRET_KEY }}
+          r2-bucket: ${{ secrets.R2_BUCKET }}
+          source-dir: artifacts
+          output-file-url: false
+          destination-dir: ${{ inputs.channel == 'beta' && format('{0}/beta', secrets.APP_NAME) || secrets.APP_NAME }}
