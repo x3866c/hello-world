@@ -1,0 +1,70 @@
+name: Release Windows
+
+on:
+  workflow_dispatch:
+
+permissions: read-all
+
+env:
+  APP_NAME: ${{ secrets.APP_NAME }}
+
+jobs:
+  windows:
+    name: Package Windows exe
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.GIT_REPO }}
+          ref: main
+          token: ${{ secrets.GIT_PAT }}
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: "3.41.6"
+
+      - name: Generate Appcast
+        run: |
+          mkdir -p artifacts/latest
+
+      - name: Build Windows
+        run: ./scripts/package/windows.ps1
+        env:
+          AGE_PRIVATE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}
+        shell: pwsh
+
+      - name: Upload to R2
+        uses: ryand56/r2-upload-action@latest
+        with:
+          r2-account-id: ${{ secrets.R2_ACCOUNT_ID }}
+          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
+          r2-secret-access-key: ${{ secrets.R2_SECRET_KEY }}
+          r2-bucket: ${{ secrets.R2_BUCKET }}
+          source-dir: artifacts
+          output-file-url: false
+          destination-dir: ${{ secrets.APP_NAME }}
+
+      - name: Upload Symbols to R2
+        uses: ryand56/r2-upload-action@latest
+        with:
+          r2-account-id: ${{ secrets.R2_ACCOUNT_ID }}
+          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
+          r2-secret-access-key: ${{ secrets.R2_SECRET_KEY }}
+          r2-bucket: ${{ secrets.R2_BUCKET }}
+          source-dir: symbols
+          output-file-url: false
+          destination-dir: ${{ secrets.APP_NAME }}/symbols
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: "v${{ steps.version.outputs.version }}"
+          name: "Release v${{ steps.version.outputs.version }}"
+          files: |
+            artifacts/latest/*.exe
+            artifacts/latest/*.zip
+          body_path: documents/changelog.md
+          repository: ${{ secrets.RELEASE_REPO }}
+          token: ${{ secrets.GIT_PAT }}
