@@ -1,0 +1,184 @@
+name: Sync Server
+
+# 自研同步服务端（sync/server）：Go 测试 + 多架构裸二进制 + 多架构 Docker 镜像。
+#
+# 和其他工作流一样，实际在公开仓库 x3866c/hello-world 上跑：用 GIT_PAT 检出私有的 GIT_REPO（见 AGENTS.md「CI」）。
+# 这里是源文件，改完再同步过去。
+#
+# 镜像发到哪里还没定（Docker Hub / GHCR / 国内镜像源，docs/sync/server/roadmap.md 第 4 节「待定」）：
+#   - 输入 image 留空时只构建、不推送，用来验证 Dockerfile 在各架构上都能编出来。
+#   - 填了 image（如 ghcr.io/<组织>/reeden-sync、registry.cn-hangzhou.aliyuncs.com/<命名空间>/reeden-sync）时推送，
+#     登录用仓库 secrets REGISTRY_USERNAME / REGISTRY_PASSWORD，登录地址取 image 的第一段（不含点号时按 Docker Hub）。
+# 镜像和二进制都是对外发布物：-trimpath -s -w，不带构建机路径（下面的 strings 检查锁定），见 AGENTS.md「对外发布」。
+# 裸二进制只作为工作流产物（artifact），发布到哪里也待定。
+
+run-name: Sync server ${{ inputs.tag || 'test' }}${{ inputs.image != '' && ' → push' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "要构建的主仓库分支、标签或提交"
+        type: string
+        default: main
+      tag:
+        description: "版本号（写进二进制 version，也是镜像标签；留空用 dev）"
+        type: string
+        default: ""
+      image:
+        description: "镜像地址（不含标签）；留空只构建不推送"
+        type: string
+        default: ""
+      platforms:
+        description: "镜像架构"
+        type: string
+        default: linux/amd64,linux/arm64
+      latest:
+        description: "推送时同时打 latest 标签"
+        type: boolean
+        default: false
+
+permissions: read-all
+
+env:
+  GOTOOLCHAIN: local
+  VERSION: ${{ inputs.tag || 'dev' }}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.GIT_REPO }}
+          ref: ${{ inputs.ref || 'main' }}
+          token: ${{ secrets.GIT_PAT }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: sync/server/go.mod
+          cache-dependency-path: sync/server/go.sum
+
+      - name: Vet
+        working-directory: sync/server
+        run: go vet ./...
+
+      - name: Test
+        working-directory: sync/server
+        run: go test -count=1 ./...
+
+      - name: Generated registry is up to date
+        working-directory: sync/server
+        run: |
+          go generate ./...
+          git diff --exit-code -- internal/registry/registry_gen.go
+
+  binaries:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      matrix:
+        target:
+          - linux/amd64
+          - linux/arm64
+          - linux/arm/7
+          - linux/riscv64
+          - linux/loong64
+          - darwin/amd64
+          - darwin/arm64
+          - windows/amd64
+          - windows/arm64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.GIT_REPO }}
+          ref: ${{ inputs.ref || 'main' }}
+          token: ${{ secrets.GIT_PAT }}
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: sync/server/go.mod
+          cache-dependency-path: sync/server/go.sum
+
+      - name: Build
+        id: build
+        working-directory: sync/server
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          IFS=/ read -r os arch arm <<< "$TARGET"
+          name="reeden-sync-${VERSION}-${os}-${arch}${arm:+v$arm}"
+          ext=""
+          [ "$os" = windows ] && ext=".exe"
+          mkdir -p dist
+          CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" GOARM="$arm" \
+            go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o "dist/${name}${ext}" ./cmd/reeden-sync
+          # 产物里不许出现构建机的绝对路径（AGENTS.md「对外发布」）
+          if strings "dist/${name}${ext}" | grep -E "$HOME|/home/runner|$GITHUB_WORKSPACE"; then
+            echo "::error::二进制里带了构建机路径"
+            exit 1
+          fi
+          echo "name=${name}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.build.outputs.name }}
+          path: sync/server/dist/*
+          retention-days: 7
+
+  image:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.GIT_REPO }}
+          ref: ${{ inputs.ref || 'main' }}
+          token: ${{ secrets.GIT_PAT }}
+
+      # Dockerfile 的构建阶段跑在构建机架构上交叉编译，QEMU 只用于运行镜像里极少的几步（目前没有），装上以防基础镜像换了
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Registry
+        id: registry
+        if: inputs.image != ''
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          first="${IMAGE%%/*}"
+          case "$first" in
+            *.*|*:*|localhost) echo "host=$first" >> "$GITHUB_OUTPUT" ;;
+            *) echo "host=" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - uses: docker/login-action@v3
+        if: inputs.image != ''
+        with:
+          registry: ${{ steps.registry.outputs.host }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Tags
+        id: tags
+        env:
+          IMAGE: ${{ inputs.image || 'reeden-sync' }}
+          LATEST: ${{ inputs.latest }}
+        run: |
+          tags="${IMAGE}:${VERSION}"
+          [ "$LATEST" = true ] && tags="${tags},${IMAGE}:latest"
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: sync
+          file: sync/server/Dockerfile
+          platforms: ${{ inputs.platforms }}
+          build-args: VERSION=${{ env.VERSION }}
+          tags: ${{ steps.tags.outputs.tags }}
+          push: ${{ inputs.image != '' }}
+          provenance: false
+          sbom: false
