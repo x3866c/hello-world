@@ -1,0 +1,89 @@
+name: Release iOS Preview
+
+# Builds iOS from the given ref (empty: the branch picked in "Use workflow from") and uploads it to TestFlight, distributed only to the given groups
+# (default: preview). No App Store submission, GitHub Release or appcast; only symbols go to R2 (beta channel).
+# Secrets: same as release.yml (GIT_REPO, GIT_PAT, AGE_PRIVATE_KEY, APP_NAME, BARK_KEY optional).
+
+run-name: Release iOS Preview (${{ inputs.ref || github.ref_name }} → ${{ inputs.groups }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit to build (empty: the workflow branch)"
+        type: string
+        default: ""
+      groups:
+        description: "TestFlight groups, comma-separated"
+        type: string
+        default: preview
+
+permissions: read-all
+
+env:
+  APP_NAME: ${{ secrets.APP_NAME }}
+
+jobs:
+  ios:
+    name: Package iOS Preview
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.GIT_REPO }}
+          ref: ${{ inputs.ref || github.ref_name }}
+          token: ${{ secrets.GIT_PAT }}
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: "3.44.9"
+          cache: true
+
+      - name: Install dependencies
+        shell: bash
+        run: bash scripts/ci/pub_get.sh
+
+      - name: Build and upload to TestFlight
+        env:
+          AGE_PRIVATE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}
+          REEDEN_RELEASE_CHANNEL: beta
+          GROUPS: ${{ inputs.groups }}
+        run: bash scripts/package/ios.sh --tf-only --tf-groups "$GROUPS"
+        shell: bash
+
+      - name: Upload Symbols to R2
+        env:
+          AGE_PRIVATE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}
+        run: bash scripts/package/upload_r2.sh upload --channel beta --symbols
+        shell: bash
+
+      - name: Get version from pubspec.yaml
+        id: version
+        if: always()
+        run: |
+          VERSION=$(grep "version:" pubspec.yaml | head -1 | sed 's/version: //' | sed 's/+.*$//')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Notify Bark
+        if: always()
+        continue-on-error: true
+        env:
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+          STATUS: ${{ job.status }}
+          REF: ${{ inputs.ref || github.ref_name }}
+          GROUPS: ${{ inputs.groups }}
+          VERSION: ${{ steps.version.outputs.version }}
+          URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -n "$BARK_KEY" ] || exit 0
+          case "$STATUS" in success) icon="✅" ;; cancelled) icon="⚪" ;; *) icon="❌" ;; esac
+          body="$REF → $GROUPS"
+          [ -n "$VERSION" ] && body="$body · v$VERSION"
+          resp=$(curl -sS --max-time 15 "https://api.day.app/$BARK_KEY" \
+            --data-urlencode "title=iOS Preview $icon" --data-urlencode "body=$body · $STATUS" \
+            --data-urlencode "url=$URL" --data-urlencode "group=release" 2>&1) || true
+          echo "$resp" | grep -q '"code":200' || echo "::warning::Bark push failed: $resp"
+        shell: bash

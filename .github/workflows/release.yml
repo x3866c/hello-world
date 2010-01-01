@@ -1,0 +1,494 @@
+name: Release App
+
+# One workflow for stable and beta releases of every platform.
+# dry_run builds every checked platform but skips R2, GitHub Release, App Store / TestFlight,
+# AppGallery and appcast uploads.
+# Secrets: GIT_REPO, GIT_PAT, AGE_PRIVATE_KEY, APP_NAME, RELEASE_REPO, BARK_KEY (optional).
+# R2 credentials live in scripts/package/secrets.age; uploads and pruning go through scripts/package/upload_r2.sh.
+
+run-name: Release ${{ inputs.channel }}${{ inputs.dry_run && ' (dry run)' || '' }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        type: choice
+        default: beta
+        options:
+          - beta
+          - stable
+      android:
+        type: boolean
+        default: true
+      android_eink:
+        type: boolean
+        default: true
+      ios:
+        type: boolean
+        default: true
+      windows:
+        type: boolean
+        default: true
+      linux:
+        type: boolean
+        default: true
+      macos:
+        type: boolean
+        default: true
+      harmonyos:
+        type: boolean
+        default: true
+      dry_run:
+        type: boolean
+        default: false
+
+permissions: read-all
+
+env:
+  APP_NAME: ${{ secrets.APP_NAME }}
+  OHOS_TOOLS_RELEASE: ci-ohos-command-line-tools-26.0.0.851
+  OHOS_TOOLS_ASSET: ohos-command-line-tools-mac-arm64-26.0.0.851.tar.xz
+
+jobs:
+  prepare:
+    name: Prepare Matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+      empty: ${{ steps.matrix.outputs.empty }}
+    steps:
+      - name: Show inputs
+        env:
+          INPUTS: ${{ toJSON(inputs) }}
+        run: |
+          {
+            echo "| Input | Value |"
+            echo "| --- | --- |"
+            echo "$INPUTS" | jq -r 'to_entries[] | "| \(.key) | \(.value) |"'
+          } >> "$GITHUB_STEP_SUMMARY"
+        shell: bash
+
+      - name: Build matrix
+        id: matrix
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          ANDROID: ${{ inputs.android }}
+          ANDROID_EINK: ${{ inputs.android_eink }}
+          IOS: ${{ inputs.ios }}
+          WINDOWS: ${{ inputs.windows }}
+          LINUX: ${{ inputs.linux }}
+          MACOS: ${{ inputs.macos }}
+        run: |
+          if [ "$DRY_RUN" = true ]; then
+            ios_script="bash scripts/package/ios.sh --skip-upload"
+          elif [ "$CHANNEL" = beta ]; then
+            ios_script="bash scripts/package/ios.sh --tf-only"
+          else
+            ios_script="bash scripts/package/ios.sh"
+          fi
+          items=()
+          [ "$ANDROID" = true ] && items+=('{"platform":"Android","runs-on":"ubuntu-22.04","flutter-version":"3.44.9","build-script":"bash scripts/package/android.sh"}')
+          [ "$ANDROID_EINK" = true ] && items+=('{"platform":"Android","name":"Android-Eink","runs-on":"ubuntu-22.04","flutter-version":"3.44.9","build-script":"bash scripts/package/android_eink.sh"}')
+          [ "$IOS" = true ] && items+=("{\"platform\":\"iOS\",\"runs-on\":\"macos-26\",\"flutter-version\":\"3.44.9\",\"build-script\":\"$ios_script\"}")
+          [ "$WINDOWS" = true ] && items+=('{"platform":"Windows","runs-on":"windows-latest","flutter-version":"3.44.9","build-script":"./scripts/package/windows.ps1"}')
+          [ "$LINUX" = true ] && items+=('{"platform":"Linux","runs-on":"ubuntu-24.04","flutter-version":"3.44.9","build-script":"./scripts/package/linux.sh"}')
+          [ "$MACOS" = true ] && items+=('{"platform":"Macos","runs-on":"macos-26","flutter-version":"3.44.9","build-script":"bash scripts/package/macos.sh"}')
+          if [ ${#items[@]} -eq 0 ]; then
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            echo 'matrix={"include":[{"platform":"none"}]}' >> "$GITHUB_OUTPUT"
+          else
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+            echo "matrix={\"include\":[$(IFS=,; echo "${items[*]}")]}" >> "$GITHUB_OUTPUT"
+          fi
+        shell: bash
+
+  release:
+    name: Package ${{ matrix.name || matrix.platform }}
+    needs: prepare
+    if: needs.prepare.outputs.empty != 'true'
+    runs-on: ${{ matrix.runs-on }}
+    # iOS / macOS 的 xcodebuild 卡住时不要耗到 GitHub 默认的 6 小时
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        if: matrix.platform == 'Android'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.GIT_REPO }}
+          ref: main
+          token: ${{ secrets.GIT_PAT }}
+
+      - name: Setup Java
+        if: matrix.platform == 'Android'
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17.x"
+          distribution: "temurin"
+
+      - name: Setup Gradle Cache (Android)
+        if: matrix.platform == 'Android'
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Configure Gradle for CI (Android)
+        if: matrix.platform == 'Android'
+        run: |
+          # User-level gradle.properties overrides android/gradle.properties.
+          mkdir -p ~/.gradle
+          cat > ~/.gradle/gradle.properties <<'PROPS'
+          org.gradle.jvmargs=-Xmx6G -XX:MaxMetaspaceSize=1G -XX:+HeapDumpOnOutOfMemoryError
+          org.gradle.daemon=false
+          org.gradle.caching=true
+          org.gradle.workers.max=2
+          kotlin.daemon.jvmargs=-Xmx1G
+          kotlin.compiler.execution.strategy=in-process
+          PROPS
+        shell: bash
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: ${{ matrix.flutter-version }}
+          cache: true
+
+      - name: Install dependencies
+        shell: bash
+        run: bash scripts/ci/pub_get.sh
+
+      # Generates the appcast and documents/changelog.md (GitHub Release body, not versioned).
+      - name: Prepare Appcast & Changelog
+        if: inputs.channel == 'stable' || matrix.platform != 'iOS'
+        run: dart scripts/release.dart --channel ${{ inputs.channel }}
+        shell: bash
+
+      - name: Build ${{ matrix.platform }}
+        if: matrix.platform != 'Windows'
+        run: ${{ matrix.build-script }}
+        env:
+          AGE_PRIVATE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}
+          REEDEN_RELEASE_CHANNEL: ${{ inputs.channel }}
+        shell: bash
+
+      - name: Build ${{ matrix.platform }}
+        if: matrix.platform == 'Windows'
+        run: ${{ matrix.build-script }}
+        env:
+          AGE_PRIVATE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}
+          REEDEN_RELEASE_CHANNEL: ${{ inputs.channel }}
+        shell: pwsh
+
+      - name: Mirror signed macOS appcast to beta channel
+        if: matrix.platform == 'Macos' && inputs.channel == 'stable'
+        run: |
+          mkdir -p artifacts/beta/latest
+          cp artifacts/latest/macos*.xml artifacts/beta/latest/
+        shell: bash
+
+      - name: Get version from pubspec.yaml
+        id: version
+        if: always()
+        run: |
+          VERSION=$(grep "version:" pubspec.yaml | head -1 | sed 's/version: //' | sed 's/+.*$//')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: List packages (dry run)
+        if: inputs.dry_run
+        run: find artifacts symbols -type f -exec ls -l {} \; 2>/dev/null || true
+        shell: bash
+
+      # Artifacts of public repositories are downloadable by anyone.
+      - name: Upload packages (dry run)
+        if: inputs.dry_run && github.event.repository.private
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name || matrix.platform }}
+          path: artifacts/latest
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload to R2
+        if: ${{ !inputs.dry_run }}
+        env:
+          AGE_PRIVATE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}
+          CHANNEL: ${{ inputs.channel }}
+          # beta iOS only goes to TestFlight, so only its symbols are uploaded.
+          WHAT: ${{ (inputs.channel != 'stable' && matrix.platform == 'iOS') && '--symbols' || '' }}
+        run: bash scripts/package/upload_r2.sh upload --channel "$CHANNEL" $WHAT
+        shell: bash
+
+      - name: Create GitHub Release
+        if: ${{ !inputs.dry_run && matrix.platform != 'iOS' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.channel == 'beta' && format('v{0}-beta', steps.version.outputs.version) || format('v{0}', steps.version.outputs.version) }}
+          name: ${{ inputs.channel == 'beta' && format('Beta v{0}', steps.version.outputs.version) || format('Release v{0}', steps.version.outputs.version) }}
+          files: |
+            artifacts/latest/*.apk
+            artifacts/latest/*.exe
+            artifacts/latest/*.zip
+            artifacts/latest/*.dmg
+            artifacts/latest/*.deb
+            artifacts/latest/*.rpm
+            artifacts/latest/*.appimage
+            artifacts/latest/*.app
+          body_path: documents/changelog.md
+          repository: ${{ secrets.RELEASE_REPO }}
+          token: ${{ secrets.GIT_PAT }}
+          draft: false
+          prerelease: ${{ inputs.channel == 'beta' }}
+
+      - name: Notify Bark
+        if: always()
+        continue-on-error: true
+        env:
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+          NAME: ${{ matrix.name || matrix.platform }}
+          STATUS: ${{ job.status }}
+          CHANNEL: ${{ inputs.channel }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          VERSION: ${{ steps.version.outputs.version }}
+          URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -n "$BARK_KEY" ] || exit 0
+          case "$STATUS" in success) icon="✅" ;; cancelled) icon="⚪" ;; *) icon="❌" ;; esac
+          body="$CHANNEL"
+          [ "$DRY_RUN" = true ] && body="$body · dry run"
+          [ -n "$VERSION" ] && body="$body · v$VERSION"
+          resp=$(curl -sS --max-time 15 "https://api.day.app/$BARK_KEY" \
+            --data-urlencode "title=$NAME $icon" --data-urlencode "body=$body · $STATUS" \
+            --data-urlencode "url=$URL" --data-urlencode "group=release" 2>&1) || true
+          echo "$resp" | grep -q '"code":200' || echo "::warning::Bark push failed: $resp"
+        shell: bash
+
+  # stable: AppGallery store review with the standard package (make ohos_appstore).
+  # beta: AppGallery invite test with the FULL package (make ohos_apptest).
+  harmonyos:
+    name: Package HarmonyOS
+    if: inputs.harmonyos
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.GIT_REPO }}
+          ref: main
+          token: ${{ secrets.GIT_PAT }}
+
+      - name: Download command line tools
+        env:
+          GH_TOKEN: ${{ secrets.GIT_PAT }}
+          SOURCE_REPO: ${{ secrets.GIT_REPO }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/ohos-tools-dl" "$RUNNER_TEMP/ohos-tools"
+          gh release download "$OHOS_TOOLS_RELEASE" -R "$SOURCE_REPO" -D "$RUNNER_TEMP/ohos-tools-dl"
+          cd "$RUNNER_TEMP/ohos-tools-dl"
+          shasum -a 256 -c "$OHOS_TOOLS_ASSET.sha256"
+          tar -xJf "$OHOS_TOOLS_ASSET" -C "$RUNNER_TEMP/ohos-tools"
+          rm -rf "$RUNNER_TEMP/ohos-tools-dl"
+        shell: bash
+
+      - name: Setup toolchain
+        env:
+          HARMONY_COMMANDLINE_TOOLS_HOME: ${{ runner.temp }}/ohos-tools
+        run: bash scripts/package/setup_harmonyos_toolchain.sh
+        shell: bash
+
+      - name: Build and publish
+        env:
+          AGE_PRIVATE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}
+          CHANNEL: ${{ inputs.channel }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          # harmonyos.sh 用鸿蒙版 Flutter 自己跑 pub get，没法提前用 pub_get.sh 拉，凭据只在这一步内有效
+          trap 'bash scripts/ci/clear_git_credentials.sh' EXIT
+          bash scripts/ci/setup_git_credentials.sh
+          args=()
+          if [ "$CHANNEL" = beta ]; then
+            args+=(--show-restricted-features)
+            [ "$DRY_RUN" = true ] || args+=(--publish-invite-test)
+          else
+            [ "$DRY_RUN" = true ] || args+=(--publish-appstore)
+          fi
+          bash scripts/package/harmonyos.sh ${args[@]+"${args[@]}"}
+        shell: bash
+
+      - name: List packages (dry run)
+        if: inputs.dry_run
+        run: find artifacts symbols -type f -exec ls -l {} \; 2>/dev/null || true
+        shell: bash
+
+      - name: Upload packages (dry run)
+        if: inputs.dry_run && github.event.repository.private
+        uses: actions/upload-artifact@v4
+        with:
+          name: HarmonyOS
+          path: artifacts/latest
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload Symbols to R2
+        if: ${{ !inputs.dry_run }}
+        env:
+          AGE_PRIVATE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}
+          CHANNEL: ${{ inputs.channel }}
+        run: bash scripts/package/upload_r2.sh upload --channel "$CHANNEL" --symbols
+        shell: bash
+
+      - name: Get version from pubspec.yaml
+        id: version
+        if: always()
+        run: |
+          VERSION=$(grep "version:" pubspec.yaml | head -1 | sed 's/version: //' | sed 's/+.*$//')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Notify Bark
+        if: always()
+        continue-on-error: true
+        env:
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+          NAME: HarmonyOS
+          STATUS: ${{ job.status }}
+          CHANNEL: ${{ inputs.channel }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          VERSION: ${{ steps.version.outputs.version }}
+          URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -n "$BARK_KEY" ] || exit 0
+          case "$STATUS" in success) icon="✅" ;; cancelled) icon="⚪" ;; *) icon="❌" ;; esac
+          body="$CHANNEL"
+          [ "$DRY_RUN" = true ] && body="$body · dry run"
+          [ -n "$VERSION" ] && body="$body · v$VERSION"
+          resp=$(curl -sS --max-time 15 "https://api.day.app/$BARK_KEY" \
+            --data-urlencode "title=$NAME $icon" --data-urlencode "body=$body · $STATUS" \
+            --data-urlencode "url=$URL" --data-urlencode "group=release" 2>&1) || true
+          echo "$resp" | grep -q '"code":200' || echo "::warning::Bark push failed: $resp"
+        shell: bash
+
+  appcast:
+    name: Upload Appcast to R2
+    runs-on: ubuntu-latest
+    needs: [prepare, release]
+    if: ${{ !inputs.dry_run && needs.prepare.outputs.empty != 'true' && (inputs.android || inputs.android_eink || inputs.windows || inputs.linux || (inputs.ios && inputs.channel == 'stable')) }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.GIT_REPO }}
+          ref: main
+          token: ${{ secrets.GIT_PAT }}
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: "3.44.9"
+
+      - name: Install dependencies
+        shell: bash
+        run: bash scripts/ci/pub_get.sh
+
+      - name: Generate Appcast
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          ANDROID: ${{ inputs.android }}
+          ANDROID_EINK: ${{ inputs.android_eink }}
+          IOS: ${{ inputs.ios }}
+          WINDOWS: ${{ inputs.windows }}
+          LINUX: ${{ inputs.linux }}
+        run: |
+          dart scripts/release.dart --appcast-only --channel "$CHANNEL"
+          mkdir -p artifacts/latest
+          [ "$CHANNEL" = stable ] && mkdir -p artifacts/beta/latest
+
+          # stable also refreshes the beta channel, so beta users see a newer stable build.
+          copy_appcast() {
+            local platform="$1"
+            cp documents/appcast/${platform}_{cn,en}.xml artifacts/latest/
+            if [ "$CHANNEL" = stable ]; then
+              cp documents/appcast/${platform}_{cn,en}.xml artifacts/beta/latest/
+            fi
+          }
+
+          [ "$ANDROID" = true ] && copy_appcast android
+          [ "$ANDROID_EINK" = true ] && copy_appcast android_eink
+          [ "$WINDOWS" = true ] && copy_appcast windows
+          [ "$LINUX" = true ] && copy_appcast linux
+          if [ "$IOS" = true ] && [ "$CHANNEL" = stable ]; then
+            copy_appcast ios
+          fi
+        shell: bash
+
+      - name: Upload to R2
+        env:
+          AGE_PRIVATE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}
+          CHANNEL: ${{ inputs.channel }}
+        run: bash scripts/package/upload_r2.sh upload --channel "$CHANNEL" --packages
+        shell: bash
+
+  prune:
+    name: Prune R2
+    runs-on: ubuntu-latest
+    needs: [prepare, release, harmonyos, appcast]
+    # Only after a clean release, so a failed run never deletes the packages users still update to.
+    if: ${{ !inputs.dry_run && !failure() && !cancelled() }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.GIT_REPO }}
+          ref: main
+          token: ${{ secrets.GIT_PAT }}
+
+      # Keep the 3 newest builds of packages and the 10 newest of symbols for this channel.
+      - name: Prune old versions
+        env:
+          AGE_PRIVATE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}
+          CHANNEL: ${{ inputs.channel }}
+        run: bash scripts/package/upload_r2.sh prune --channel "$CHANNEL" --keep-packages 3 --keep-symbols 10
+        shell: bash
+
+  notify:
+    name: Notify
+    runs-on: ubuntu-latest
+    needs: [prepare, release, harmonyos, appcast, prune]
+    if: always()
+    steps:
+      - name: Notify Bark
+        env:
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ inputs.channel }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          FAILED: ${{ contains(needs.*.result, 'failure') }}
+          CANCELLED: ${{ contains(needs.*.result, 'cancelled') }}
+          URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          [ -n "$BARK_KEY" ] || { echo "BARK_KEY not set, skipped"; exit 0; }
+          if [ "$FAILED" = true ]; then icon="❌"; elif [ "$CANCELLED" = true ]; then icon="⚪"; else icon="✅"; fi
+          title="Release $CHANNEL"
+          [ "$DRY_RUN" = true ] && title="$title (dry run)"
+          body=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/jobs?per_page=100" --jq '
+            .jobs[]
+            | select(.name != "Notify" and .conclusion != null and .conclusion != "skipped")
+            | select((.name == "Prepare Matrix" and .conclusion == "success") | not)
+            | "\(.name | sub("^Package "; "")) \(if .conclusion == "success" then "✅" elif .conclusion == "cancelled" then "⚪" else "❌" end)"')
+          resp=$(curl -sS --max-time 15 "https://api.day.app/$BARK_KEY" \
+            --data-urlencode "title=$title $icon" --data-urlencode "body=${body:-No jobs ran}" \
+            --data-urlencode "url=$URL" --data-urlencode "group=release" 2>&1) || true
+          echo "$resp" | grep -q '"code":200' || echo "::warning::Bark push failed: $resp"
+        shell: bash
