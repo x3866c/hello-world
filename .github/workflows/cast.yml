@@ -1,0 +1,39 @@
+name: Release Static
+
+on:
+  workflow_dispatch:
+
+permissions: read-all
+
+env:
+  APP_NAME: ${{ secrets.APP_NAME }}
+
+jobs:
+  release:
+    name: Release Static
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.GIT_REPO }}
+          ref: main
+          token: ${{ secrets.GIT_PAT }}
+
+      - name: Generate Static
+        run: |
+          mkdir -p artifacts/latest
+          cp documents/appcast/windows*.xml artifacts/latest/
+          cp documents/appcast/android*.xml artifacts/latest/
+          cp documents/appcast/linux*.xml artifacts/latest/
+          cp documents/appcast/ios*.xml artifacts/latest/
+
+      - name: Upload to R2
+        uses: ryand56/r2-upload-action@latest
+        with:
+          r2-account-id: ${{ secrets.R2_ACCOUNT_ID }}
+          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
+          r2-secret-access-key: ${{ secrets.R2_SECRET_KEY }}
+          r2-bucket: ${{ secrets.R2_BUCKET }}
+          source-dir: artifacts
+          output-file-url: false
+          destination-dir: ${{ secrets.APP_NAME }}
