@@ -1,0 +1,164 @@
+name: Release App
+
+on:
+  workflow_dispatch:
+
+# Declare default permissions as readonly.
+permissions: read-all
+
+env:
+  APP_NAME: ${{ secrets.APP_NAME }}
+
+jobs:
+  release:
+    name: Package ${{ matrix.platform }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: Android
+            runs-on: ubuntu-22.04
+            build-script: bash scripts/package/android.sh
+          - platform: iOS
+            runs-on: macos-26
+            build-script: bash scripts/package/ios.sh
+          - platform: Windows
+            runs-on: windows-latest
+            build-script: ./scripts/package/windows.ps1
+          - platform: Linux
+            runs-on: ubuntu-24.04
+            build-script: ./scripts/package/linux.sh
+          - platform: Macos
+            runs-on: macos-26
+            build-script: bash scripts/package/macos.sh
+
+    steps:
+      - name: Free Disk Space (Ubuntu)
+        if: matrix.platform == 'Android'
+        uses: jlumbroso/free-disk-space@main
+        with:
+          # this might remove tools that are actually needed,
+          # if set to "true" but frees about 6 GB
+          tool-cache: false
+
+          # all of these default to true, but feel free to set to
+          # "false" if necessary for your workflow
+          android: false
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.GIT_REPO }}
+          ref: main
+          token: ${{ secrets.GIT_PAT }}
+
+      - name: Setup Java
+        if: matrix.platform == 'Android'
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17.x"
+          distribution: "temurin"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: "3.41.2"
+
+      - name: Build ${{ matrix.platform }}
+        if: matrix.platform != 'Windows'
+        run: ${{ matrix.build-script }}
+        env:
+          AGE_PRIVATE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}
+        shell: bash
+
+      - name: Build ${{ matrix.platform }}
+        if: matrix.platform == 'Windows'
+        run: ${{ matrix.build-script }}
+        env:
+          AGE_PRIVATE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}
+        shell: pwsh
+
+      - name: Get version from pubspec.yaml
+        id: version
+        run: |
+          VERSION=$(grep "version:" pubspec.yaml | head -1 | sed 's/version: //' | sed 's/+.*$//')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+        shell: bash
+
+      - name: Upload to R2
+        uses: ryand56/r2-upload-action@latest
+        with:
+          r2-account-id: ${{ secrets.R2_ACCOUNT_ID }}
+          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
+          r2-secret-access-key: ${{ secrets.R2_SECRET_KEY }}
+          r2-bucket: ${{ secrets.R2_BUCKET }}
+          source-dir: artifacts
+          output-file-url: false
+          destination-dir: ${{ secrets.APP_NAME }}
+
+      # - name: Upload Symbols to R2
+      #   uses: ryand56/r2-upload-action@latest
+      #   with:
+      #     r2-account-id: ${{ secrets.R2_ACCOUNT_ID }}
+      #     r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
+      #     r2-secret-access-key: ${{ secrets.R2_SECRET_KEY }}
+      #     r2-bucket: ${{ secrets.R2_BUCKET }}
+      #     source-dir: symbols
+      #     output-file-url: false
+      #     destination-dir: ${{ secrets.APP_NAME }}/symbols
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: matrix.platform != 'iOS'
+        with:
+          tag_name: "v${{ steps.version.outputs.version }}"
+          name: "Release v${{ steps.version.outputs.version }}"
+          files: |
+            artifacts/latest/*.apk
+            artifacts/latest/*.exe
+            artifacts/latest/*.zip
+            artifacts/latest/*.dmg
+            artifacts/latest/*.deb
+            artifacts/latest/*.rpm
+            artifacts/latest/*.appimage
+          body_path: documents/changelog.md
+          repository: ${{ secrets.RELEASE_REPO }}
+          token: ${{ secrets.GIT_PAT }}
+          draft: false
+          prerelease: false
+
+  appcast:
+    name: Upload Appcast to R2
+    runs-on: ubuntu-latest
+    needs: release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ secrets.GIT_REPO }}
+          ref: main
+          token: ${{ secrets.GIT_PAT }}
+
+      - name: Generate Appcast
+        run: |
+          mkdir -p artifacts/latest
+          cp documents/appcast/windows*.xml artifacts/latest/
+          cp documents/appcast/android*.xml artifacts/latest/
+          cp documents/appcast/linux*.xml artifacts/latest/
+          cp documents/appcast/ios*.xml artifacts/latest/
+
+      - name: Upload to R2
+        uses: ryand56/r2-upload-action@latest
+        with:
+          r2-account-id: ${{ secrets.R2_ACCOUNT_ID }}
+          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
+          r2-secret-access-key: ${{ secrets.R2_SECRET_KEY }}
+          r2-bucket: ${{ secrets.R2_BUCKET }}
+          source-dir: artifacts
+          output-file-url: false
+          destination-dir: ${{ secrets.APP_NAME }}
