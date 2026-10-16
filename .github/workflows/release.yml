@@ -3,7 +3,8 @@ name: Release App
 # One workflow for stable and beta releases of every platform.
 # dry_run builds every checked platform but skips R2, GitHub Release, App Store / TestFlight,
 # AppGallery and appcast uploads.
-# Secrets: GIT_REPO, GIT_PAT, AGE_PRIVATE_KEY, APP_NAME, RELEASE_REPO, R2_*, BARK_KEY (optional).
+# Secrets: GIT_REPO, GIT_PAT, AGE_PRIVATE_KEY, APP_NAME, RELEASE_REPO, BARK_KEY (optional).
+# R2 credentials live in scripts/package/secrets.age; uploads and pruning go through scripts/package/upload_r2.sh.
 
 run-name: Release ${{ inputs.channel }}${{ inputs.dry_run && ' (dry run)' || '' }}
 
@@ -12,10 +13,10 @@ on:
     inputs:
       channel:
         type: choice
-        default: stable
+        default: beta
         options:
-          - stable
           - beta
+          - stable
       android:
         type: boolean
         default: true
@@ -219,28 +220,14 @@ jobs:
           retention-days: 7
 
       - name: Upload to R2
-        if: ${{ !inputs.dry_run && (inputs.channel == 'stable' || matrix.platform != 'iOS') }}
-        uses: ryand56/r2-upload-action@latest
-        with:
-          r2-account-id: ${{ secrets.R2_ACCOUNT_ID }}
-          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
-          r2-secret-access-key: ${{ secrets.R2_SECRET_KEY }}
-          r2-bucket: ${{ secrets.R2_BUCKET }}
-          source-dir: artifacts
-          output-file-url: false
-          destination-dir: ${{ inputs.channel == 'beta' && format('{0}/beta', secrets.APP_NAME) || secrets.APP_NAME }}
-
-      - name: Upload Symbols to R2
         if: ${{ !inputs.dry_run }}
-        uses: ryand56/r2-upload-action@latest
-        with:
-          r2-account-id: ${{ secrets.R2_ACCOUNT_ID }}
-          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
-          r2-secret-access-key: ${{ secrets.R2_SECRET_KEY }}
-          r2-bucket: privatedata
-          source-dir: symbols
-          output-file-url: false
-          destination-dir: ${{ inputs.channel == 'beta' && format('{0}/beta/symbols', secrets.APP_NAME) || format('{0}/symbols', secrets.APP_NAME) }}
+        env:
+          AGE_PRIVATE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}
+          CHANNEL: ${{ inputs.channel }}
+          # beta iOS only goes to TestFlight, so only its symbols are uploaded.
+          WHAT: ${{ (inputs.channel != 'stable' && matrix.platform == 'iOS') && '--symbols' || '' }}
+        run: bash scripts/package/upload_r2.sh upload --channel "$CHANNEL" $WHAT
+        shell: bash
 
       - name: Create GitHub Release
         if: ${{ !inputs.dry_run && matrix.platform != 'iOS' }}
@@ -351,15 +338,11 @@ jobs:
 
       - name: Upload Symbols to R2
         if: ${{ !inputs.dry_run }}
-        uses: ryand56/r2-upload-action@latest
-        with:
-          r2-account-id: ${{ secrets.R2_ACCOUNT_ID }}
-          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
-          r2-secret-access-key: ${{ secrets.R2_SECRET_KEY }}
-          r2-bucket: privatedata
-          source-dir: symbols
-          output-file-url: false
-          destination-dir: ${{ inputs.channel == 'beta' && format('{0}/beta/symbols', secrets.APP_NAME) || format('{0}/symbols', secrets.APP_NAME) }}
+        env:
+          AGE_PRIVATE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}
+          CHANNEL: ${{ inputs.channel }}
+        run: bash scripts/package/upload_r2.sh upload --channel "$CHANNEL" --symbols
+        shell: bash
 
       - name: Get version from pubspec.yaml
         id: version
@@ -445,20 +428,37 @@ jobs:
         shell: bash
 
       - name: Upload to R2
-        uses: ryand56/r2-upload-action@latest
+        env:
+          AGE_PRIVATE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}
+          CHANNEL: ${{ inputs.channel }}
+        run: bash scripts/package/upload_r2.sh upload --channel "$CHANNEL" --packages
+        shell: bash
+
+  prune:
+    name: Prune R2
+    runs-on: ubuntu-latest
+    needs: [prepare, release, harmonyos, appcast]
+    # Only after a clean release, so a failed run never deletes the packages users still update to.
+    if: ${{ !inputs.dry_run && !failure() && !cancelled() }}
+    steps:
+      - uses: actions/checkout@v4
         with:
-          r2-account-id: ${{ secrets.R2_ACCOUNT_ID }}
-          r2-access-key-id: ${{ secrets.R2_ACCESS_KEY }}
-          r2-secret-access-key: ${{ secrets.R2_SECRET_KEY }}
-          r2-bucket: ${{ secrets.R2_BUCKET }}
-          source-dir: artifacts
-          output-file-url: false
-          destination-dir: ${{ inputs.channel == 'beta' && format('{0}/beta', secrets.APP_NAME) || secrets.APP_NAME }}
+          repository: ${{ secrets.GIT_REPO }}
+          ref: main
+          token: ${{ secrets.GIT_PAT }}
+
+      # Keep the 3 newest builds of packages and the 10 newest of symbols for this channel.
+      - name: Prune old versions
+        env:
+          AGE_PRIVATE_KEY: ${{ secrets.AGE_PRIVATE_KEY }}
+          CHANNEL: ${{ inputs.channel }}
+        run: bash scripts/package/upload_r2.sh prune --channel "$CHANNEL" --keep-packages 3 --keep-symbols 10
+        shell: bash
 
   notify:
     name: Notify
     runs-on: ubuntu-latest
-    needs: [prepare, release, harmonyos, appcast]
+    needs: [prepare, release, harmonyos, appcast, prune]
     if: always()
     steps:
       - name: Notify Bark
